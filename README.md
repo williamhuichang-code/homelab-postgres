@@ -29,8 +29,13 @@ From the server itself:
 ## Design decisions
 - **Host port 5433:** Synology DSM runs its own built-in Postgres on port 5432, so this container is mapped to host port 5433 to avoid the conflict. Inside the container, Postgres still listens on 5432.
 - **UTC time zone:** timestamps are stored in UTC and converted only when displayed.
-- **Secrets outside Git:** credentials live only in `.env`, which `.gitignore` excludes. `.env.example` lists the variables needed.
 - **Persistent data:** the database lives in `./data`, a bind mount that survives container updates and is excluded from Git.
+
+## Security
+- **No public exposure:** port 5433 is never forwarded on the router. Exposing a database directly to the internet invites constant automated scanning and password-guessing attacks.
+- **Remote access via Tailscale:** remote connections go through Tailscale, an encrypted private network (WireGuard-based). Only devices logged into my Tailscale account can reach the database.
+- **Key expiry disabled on the server only:** the NAS stays connected permanently. Client devices such as laptops keep key expiry on, so a lost device loses access automatically.
+- **Secrets outside Git:** credentials live only in `.env`, which is excluded by `.gitignore`.
 
 ## Troubleshooting
 | Error | Cause | Fix |
