@@ -59,7 +59,7 @@ homelab-postgres/
     │   └── versions/
     │       └── 0001_create_raw_tables.py
     ├── src/
-    │   └── extract_load.py     ← pipeline (in progress)
+    │   └── extract_load.py     ← pipeline: ActivityWatch API → raw tables
     ├── alembic.ini
     ├── requirements.txt
     └── .env.example            ← pipeline settings (real .env not committed)
@@ -105,10 +105,18 @@ cp .env.example .env        # fill in DB host, admin and etl credentials
 alembic upgrade head
 ```
 
+### 4. Load data (on the laptop, ActivityWatch running)
+```bash
+conda activate homelab
+cd activitywatch
+python src/extract_load.py
+```
+The first run loads all history; later runs fetch only new and recently changed events.
+
 ## Connecting
 | Client | Host | Port |
 |--------|------|------|
-| DBeaver / any SQL client | NAS LAN IP (at home) or Tailscale hostname (remote) | `5433` |
+| DBeaver / any SQL client | NAS LAN IP (at home) or Tailscale hostname (remote); enable **Show all databases** to see `activity` | `5433` |
 | pgAdmin (browser) | `http://<NAS IP>:5050` | `5050` |
 | pgAdmin → Postgres (server registration) | `postgres` (Docker service name) | `5432` |
 | psql on the NAS | `sudo docker exec -it postgres psql -U <user> -d <database>` | n/a |
@@ -150,13 +158,36 @@ in `raw` is covered automatically. Verified with `\dp raw.*` → `etl=arw/<admin
 
 **Buckets collected:** window (app and title), AFK (active/away), Chrome web tabs.
 
-**Load strategy (planned for `extract_load.py`)**
-- *Incremental:* fetch only events newer than the latest loaded `ts`, minus a 1-hour overlap.
-- *Idempotent:* upsert on the primary key, so re-runs never duplicate rows.
-- *Overlap:* the most recent event keeps growing in duration; re-fetching the last hour captures its final value.
+**Load strategy (`extract_load.py`)**
+- *Incremental:* for each bucket, fetch events from the latest loaded `ts` (the watermark) minus a 1-hour overlap; the first run loads all history.
+- *Idempotent:* `INSERT ... ON CONFLICT (bucket_id, event_id) DO UPDATE`, so re-runs never duplicate rows.
+- *Change-aware updates:* a row is only updated when its payload actually changed (`IS DISTINCT FROM`), so `last_loaded_at` shows when an event last changed and `first_loaded_at` when it first arrived.
+- *Overlap:* the most recent event keeps growing in duration, and AFK/browser events can arrive late or backdated; re-fetching the last hour captures both.
+- *Commit per bucket:* a failure in one bucket doesn't roll back the others.
+- *Least privilege:* the script connects as `etl`.
+
+**Upsert vs append-only (decision deferred):** an append-only raw layer would keep every version of an
+event and deduplicate in `core`. Upsert was chosen for now; `first_loaded_at` / `last_loaded_at`
+collect evidence on how often events change after loading, to revisit the choice and the overlap length with real data:
+```sql
+SELECT bucket_id,
+       count(*) FILTER (WHERE last_loaded_at > first_loaded_at) AS changed_later,
+       max(last_loaded_at - first_loaded_at)                     AS longest_change_window
+FROM raw.aw_events
+GROUP BY bucket_id;
+```
+
+**Verification**
+
+| Check | Result |
+|-------|--------|
+| First run (full history) | 7,773 events: window 7,084 · AFK 431 · web 256 · duplicate web bucket 1 · stopwatch 1 |
+| Counts on the NAS (psql) and in DBeaver | Match the script output exactly |
+| Second run (idempotency) | Total 7,932 (+159 genuinely new events), 5 existing events updated in place, 0 duplicates |
 
 **Data-quality findings from exploring the source**
 - **Mislabelled timestamps:** bucket `created` is local time (UTC+8) labelled as UTC; event timestamps are true UTC.
+  *Confirmed with data:* the first AFK event is `10:11:33.524 UTC`, while the bucket's `created` reads `18:11:33.524781+00:00`: the same moment, shifted by exactly 8 hours.
 - **Overlapping AFK events:** two `afk` events can share a start time with different durations; summing durations naively double-counts time.
 - **Duplicate web bucket:** `aw-watcher-web-chrome` (no hostname) holds a single event from the extension install.
 - **Non-continuous IDs:** event IDs skip numbers because ActivityWatch merges repeated heartbeats; IDs appear to be shared across buckets.
@@ -192,6 +223,8 @@ Raw keeps all of this untouched; cleaning rules belong in `core`.
 | `syntax error at or near ":"` in the bootstrap | psql variable name mismatch (`-v elt_password` vs `:'etl_password'`); undefined variables are left in the SQL as-is | Pass the exact variable name with `-v` |
 | Password test shows `Password Used: false` | Connection from inside the container is trusted | Test through `-h <NAS IP> -p 5433` |
 | `'py' is not recognized` / VS Code "No Python found" | Python installed via conda, not the python.org launcher | Use a conda env (`conda activate homelab`) and select it as the VS Code interpreter |
+| `Could not open requirements file` | File created in the repo root instead of `activitywatch/` | Right-click the target folder in VS Code before *New File*; check with `ls` |
+| DBeaver only lists `mydb` | Connection shows only its default database | Edit Connection → **Show all databases** |
 
 ## Roadmap
 - [x] Postgres running in Docker, configured as code
@@ -201,7 +234,7 @@ Raw keeps all of this untouched; cleaning rules belong in `core`.
 - [x] Real data source chosen: ActivityWatch (window, AFK and web buckets explored)
 - [x] Roles and permissions: admin and least-privilege `etl` role
 - [x] Schema migrations with Alembic (revision 0001, rollback tested)
-- [ ] Data pipeline: `extract_load.py` (incremental, idempotent)
+- [x] Data pipeline: `extract_load.py` (incremental, idempotent; verified with a second run)
 - [ ] Hourly scheduling with Windows Task Scheduler
 - [ ] Core layer: 3NF model built from raw
 - [ ] Read-only `analyst` role
