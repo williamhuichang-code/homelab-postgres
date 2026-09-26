@@ -2,3 +2,4 @@
 data/
 pgadmin/
 __pycache__/
+logs/
