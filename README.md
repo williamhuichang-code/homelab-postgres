@@ -27,7 +27,8 @@ ActivityWatch (localhost:5600)
    │  REST API
    ▼
 extract_load.py  ── Tailscale :5433 ──►  Postgres: activity database
-(runs as etl user)                          └── raw schema  (data as received)
+(runs as etl user, hourly               └── raw schema  (data as received)
+ via Task Scheduler)
                                             └── core schema (3NF model, planned)
 Alembic          ── Tailscale :5433 ──►  schema changes (runs as admin)
 ```
@@ -60,6 +61,8 @@ homelab-postgres/
     │       └── 0001_create_raw_tables.py
     ├── src/
     │   └── extract_load.py     ← pipeline: ActivityWatch API → raw tables
+    ├── run_extract_load.bat    ← launcher used by Windows Task Scheduler
+    ├── logs/                   ← run logs (not committed)
     ├── alembic.ini
     ├── requirements.txt
     └── .env.example            ← pipeline settings (real .env not committed)
@@ -72,6 +75,7 @@ homelab-postgres/
 | **DBeaver** | Laptop (desktop app) | Day-to-day querying and data exploration |
 | **psql** | NAS (command line) | Quick checks, and running the bootstrap script |
 | **Alembic** | Laptop (command line) | Creating and changing tables through versioned migrations |
+| **Task Scheduler** | Laptop (Windows) | Running the pipeline every hour |
 
 ## Setup
 
@@ -112,6 +116,24 @@ cd activitywatch
 python src/extract_load.py
 ```
 The first run loads all history; later runs fetch only new and recently changed events.
+
+### 5. Schedule hourly runs (on the laptop)
+`run_extract_load.bat` changes into the project folder, calls the conda environment's Python by its
+full path (Task Scheduler doesn't know about `conda activate`), and appends a timestamped block with
+the script's output and any errors to `logs/extract_load.log`.
+
+Task Scheduler → **Create Task**:
+
+| Tab | Setting |
+|-----|---------|
+| General | Name `ActivityWatch ETL`; *Run only when user is logged on* |
+| Triggers | Daily, **repeat every 1 hour** for a duration of **Indefinitely** |
+| Actions | Start a program → `run_extract_load.bat` |
+| Conditions | Untick *Start only if on AC power* |
+| Settings | *Run as soon as possible after a scheduled start is missed*; *Do not start a new instance* if already running |
+
+Check a run: right-click the task → **Run**, then look for a new block at the end of
+`logs/extract_load.log`. Each block lists every bucket with its event count and the time it fetched from.
 
 ## Connecting
 | Client | Host | Port |
@@ -184,6 +206,17 @@ GROUP BY bucket_id;
 | First run (full history) | 7,773 events: window 7,084 · AFK 431 · web 256 · duplicate web bucket 1 · stopwatch 1 |
 | Counts on the NAS (psql) and in DBeaver | Match the script output exactly |
 | Second run (idempotency) | Total 7,932 (+159 genuinely new events), 5 existing events updated in place, 0 duplicates |
+| Scheduled run (Task Scheduler) | New log block written; window bucket fetched only from its watermark minus 1 hour |
+
+**Reading the log**
+- A bucket's *from* time only moves when a newer event **starts**. During one long active period the
+  AFK watermark stays put while that event's duration grows; the upsert updates it in place.
+- Buckets with no new events (the duplicate web bucket, the stopwatch) re-read the same event every
+  run. This is harmless: nothing changed, so no row is updated.
+
+**Failure behaviour:** if the laptop is off, the NAS or Tailscale is unreachable, or ActivityWatch
+isn't running, that run fails with an error in the log, and the next successful run catches up from
+the watermark.
 
 **Data-quality findings from exploring the source**
 - **Mislabelled timestamps:** bucket `created` is local time (UTC+8) labelled as UTC; event timestamps are true UTC.
@@ -223,8 +256,8 @@ Raw keeps all of this untouched; cleaning rules belong in `core`.
 | `syntax error at or near ":"` in the bootstrap | psql variable name mismatch (`-v elt_password` vs `:'etl_password'`); undefined variables are left in the SQL as-is | Pass the exact variable name with `-v` |
 | Password test shows `Password Used: false` | Connection from inside the container is trusted | Test through `-h <NAS IP> -p 5433` |
 | `'py' is not recognized` / VS Code "No Python found" | Python installed via conda, not the python.org launcher | Use a conda env (`conda activate homelab`) and select it as the VS Code interpreter |
-| `Could not open requirements file` | File created in the repo root instead of `activitywatch/` | Right-click the target folder in VS Code before *New File*; check with `ls` |
 | DBeaver only lists `mydb` | Connection shows only its default database | Edit Connection → **Show all databases** |
+| Scheduled task produces no output | Task Scheduler discards printed output | Redirect to a log file in the launcher (`>> logs\extract_load.log 2>&1`) |
 
 ## Roadmap
 - [x] Postgres running in Docker, configured as code
@@ -235,7 +268,7 @@ Raw keeps all of this untouched; cleaning rules belong in `core`.
 - [x] Roles and permissions: admin and least-privilege `etl` role
 - [x] Schema migrations with Alembic (revision 0001, rollback tested)
 - [x] Data pipeline: `extract_load.py` (incremental, idempotent; verified with a second run)
-- [ ] Hourly scheduling with Windows Task Scheduler
+- [x] Hourly scheduling with Windows Task Scheduler, with run logs
 - [ ] Core layer: 3NF model built from raw
 - [ ] Read-only `analyst` role
 - [ ] Query performance tuning
